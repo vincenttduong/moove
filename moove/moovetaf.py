@@ -477,9 +477,6 @@ def stream_callback(indata, outdata, frames, time_info, status):
     else:
         logger.error("Too many input channels given. Only 1 or 2 channels are allowed.\nPlease quit the program!!!")
         
-
-    # multiply audio_signal to get signal range between -1 and 1
-    audio_data = audio_data * 1e2
     audio_data = np.asarray(audio_data, dtype=np.float32)
     raw_audio_chunks.append(audio_data.copy())
 
