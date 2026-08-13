@@ -8,17 +8,12 @@ bin), stacked vertically in order of increasing duration, all aligned so
 that t=0 is that segment's true onset. Offsets are marked with a distinct,
 easy-to-track marker (a red triangle sitting just above each trace, at that
 row's true offset position) so you can visually trace the "staircase" of
-offsets across rows and spot outliers -- e.g. a segment whose offset marker
-falls far from where its neighbors' do for a similar-looking trace, or a
-trace whose energy clearly continues past its offset marker (a truncated
-segment) or ends well before it (a segment capturing trailing silence).
+offsets across rows and spot outliers.
 
 Traces are NOT padded/truncated to a common length: each trace's width
 reflects its own true duration (onset to offset, plus a small fixed pad on
 each side for context), so the actual spread of syllable durations remains
-visible in the figure -- which is the point of this validation step, since
-duration is diagnostic of segmentation quality (missed/extra onsets,
-merged/split syllables, etc. show up as duration outliers).
+visible in the figure.
 
 MOOVE folder structure (as used by moove.utils.AppState._get_batch_files):
 
@@ -27,25 +22,13 @@ MOOVE folder structure (as used by moove.utils.AppState._get_batch_files):
             <day_1>/
                 <recording_1>.wav
                 <recording_1>.wav.not.mat
-                <recording_2>.wav
-                <recording_2>.wav.not.mat
                 ...
                 batch.txt
             <day_2>/
                 ...
 
-Each day folder holds many short .wav recordings. Each recording has a
-sibling `<recording>.wav.not.mat` file (evfuncs/EvTAF format) storing that
-recording's segmentation as parallel `onsets`/`offsets` arrays, in seconds.
-A cluster/training dataset is built by walking every .wav in a day folder,
-reading its .not.mat, and treating every (onset, offset) pair as one
-syllable segment -- this script does the same, without any label filtering,
-since segmentation should be validated before syllable labels are assigned.
-
-Requires the `moove` package to be installed (editable or otherwise) so it
-can reuse evfuncs.load_notmat, moove.utils.get_display_data, and
-moove.utils.decibel for audio/segment loading, exactly matching how MOOVE's
-own cluster-dataset-creation step reads segments.
+Requires the `moove` package to be installed so it can reuse
+evfuncs.load_notmat, moove.utils.get_display_data, and moove.utils.decibel.
 
 Usage: fill in the USER-MODIFIABLE VARIABLES section below, then run:
     python validate_segmentation.py
@@ -63,40 +46,17 @@ from moove.utils import get_display_data, decibel
 # USER-MODIFIABLE VARIABLES
 # ======================================================================
 
-# 1) Root folder for the bird, e.g. r"F:\Data\bird1"
 BIRD_ROOT = r"PATH_TO_BIRD_ROOT"
-
-# 2) Experiment folder name (single subfolder of BIRD_ROOT), e.g. "pre_lesion"
 EXPERIMENT = "EXPERIMENT_FOLDER_NAME"
-
-# 3) List of experiment day folder names (subfolders of the experiment
-#    folder) to pool segments from, e.g. ["day1", "day2", "day3"]
 DAYS = ["DAY_FOLDER_1", "DAY_FOLDER_2"]
-
-# 4) Fraction (0 < f <= 1) of the total pooled segments (across all DAYS
-#    combined) to randomly sample for the figure. Sampling is done once,
-#    consistently, across the pooled set -- not independently per day --
-#    so the relative contribution of each day to the final figure reflects
-#    that day's share of total segments.
 SAMPLE_FRACTION = 0.1
 
-# Spectrogram parameters (should match the values you use elsewhere in
-# MOOVE's Cluster/Training dialogs for consistency, but can be changed).
 NPERSEG = 1024
 NOVERLAP = 896
 NFFT = 1024
 FREQ_CUTOFFS = (500, 10000)  # (low_hz, high_hz)
-
-# Fixed context padding shown before onset and after offset in each trace's
-# extraction window (does NOT equalize trace lengths -- every trace still
-# has width = duration + 2*PAD_SECONDS, so true duration remains visible).
 PAD_SECONDS = 0.02
-
-# Random seed for reproducible sampling (set to None for a fresh sample
-# every run).
 RANDOM_SEED = 42
-
-# Output figure path.
 OUTPUT_FIGURE_PATH = "segmentation_validation.png"
 
 # ======================================================================
@@ -114,8 +74,15 @@ def find_wav_files(day_path):
 
 
 def load_notmat_segments(wav_path):
-    """Return (onsets, offsets) in seconds for a .wav file's sibling
-    .not.mat, or (None, None) if no .not.mat exists / it has no segments."""
+    """Return (onsets, offsets) IN SECONDS for a .wav file's sibling
+    .not.mat, or (None, None) if no .not.mat exists / it has no segments.
+
+    evfuncs.load_notmat's onsets/offsets are stored in MILLISECONDS in the
+    underlying .not.mat format (confirmed directly in MATLAB against this
+    dataset's .not.mat files -- the EvTAF/evsonganaly convention) -- they
+    are converted to seconds here, once, at the source, so every
+    downstream consumer of this function can assume seconds.
+    """
     import evfuncs
 
     notmat_path = wav_path + ".not.mat"
@@ -126,14 +93,16 @@ def load_notmat_segments(wav_path):
     offsets = notmat_dict.get("offsets", [])
     if len(onsets) == 0 or len(offsets) == 0:
         return None, None
-    return onsets, offsets
+    onsets_sec = np.asarray(onsets, dtype=float) / 1000.0
+    offsets_sec = np.asarray(offsets, dtype=float) / 1000.0
+    return onsets_sec, offsets_sec
 
 
 def gather_all_segments(bird_root, experiment, days):
     """Walk every day folder, every .wav file within it, and every
-    onset/offset pair within that file's .not.mat. Returns a flat list of
-    dicts: {wav_path, onset, offset, day} for every syllable segment found,
-    with no label filtering."""
+    onset/offset pair within that file's .not.mat (already converted to
+    seconds by load_notmat_segments). Returns a flat list of dicts:
+    {wav_path, onset, offset, day}, with no label filtering."""
     all_segments = []
     for day in days:
         day_path = os.path.join(bird_root, experiment, day)
@@ -159,26 +128,52 @@ def gather_all_segments(bird_root, experiment, days):
     return all_segments
 
 
+def run_diagnostic_check(all_segments, config):
+    """Print raw numbers for a few segments up front, before the full run,
+    so any units/path mismatch is immediately visible rather than causing
+    silent failures with no clue why. Checks segment duration sanity and
+    whether onset/offset actually fall within the recording's audio length
+    once loaded."""
+    print("\n--- Diagnostic check on first 3 segments ---")
+    for seg in all_segments[:3]:
+        duration = seg["offset"] - seg["onset"]
+        print(f"  {os.path.basename(seg['wav_path'])}: "
+              f"onset={seg['onset']:.4f}s offset={seg['offset']:.4f}s "
+              f"duration={duration * 1000:.1f}ms")
+        try:
+            file_path = {"file_name": os.path.basename(seg["wav_path"]),
+                        "file_path": seg["wav_path"]}
+            display_dict = get_display_data(file_path, config)
+            sr = int(display_dict["sampling_rate"])
+            recording_duration = len(display_dict["song_data"]) / sr
+            print(f"    -> recording: sampling_rate={sr} Hz, "
+                  f"duration={recording_duration:.3f}s, "
+                  f"onset_within_recording={seg['onset'] <= recording_duration}, "
+                  f"offset_within_recording={seg['offset'] <= recording_duration}")
+        except Exception as e:
+            print(f"    -> could not load recording for diagnostic: {e}")
+    print("--- End diagnostic check ---\n")
+
+
 def extract_segment_spectral_sum(wav_path, onset, offset, config,
                                   nperseg, noverlap, nfft, freq_cutoffs,
-                                  pad_seconds):
+                                  pad_seconds, verbose_errors=True):
     """Load raw audio spanning [onset - pad_seconds, offset + pad_seconds],
     compute its spectrogram, restrict to freq_cutoffs, and collapse across
     frequency (sum) to get a 1D power-vs-time trace in dB. Time is returned
-    ALIGNED TO ONSET: t=0 always corresponds to the true onset, so t=-pad
-    is the start of the window and t=(offset-onset) is the true offset,
-    regardless of whether the window had to be clipped at the start of the
-    recording (clipping only shortens the pre-onset context shown, it never
-    shifts the onset/offset positions themselves).
+    ALIGNED TO ONSET: t=0 always corresponds to the true onset.
 
     Returns (t_aligned_to_onset, power_trace_db, offset_rel_to_onset,
-    sampling_rate) or None if loading/processing fails.
+    sampling_rate) on success, or None on failure. When verbose_errors is
+    True, every failure path prints exactly why it failed.
     """
     file_path = {"file_name": os.path.basename(wav_path), "file_path": wav_path}
     try:
         display_dict = get_display_data(file_path, config)
     except Exception as e:
-        print(f"  Skipping segment in {os.path.basename(wav_path)}: failed to load audio ({e})")
+        if verbose_errors:
+            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
+                  f"get_display_data() raised: {e}")
         return None
 
     sampling_rate = int(display_dict["sampling_rate"])
@@ -189,11 +184,19 @@ def extract_segment_spectral_sum(wav_path, onset, offset, config,
     start_idx = int(win_start * sampling_rate)
     end_idx = int(win_end * sampling_rate)
     end_idx = min(end_idx, len(rawsong))
+
     if start_idx >= end_idx:
+        if verbose_errors:
+            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
+                  f"start_idx ({start_idx}) >= end_idx ({end_idx}). "
+                  f"len(rawsong)={len(rawsong)}, sampling_rate={sampling_rate}.")
         return None
 
     windowed_audio = rawsong[start_idx:end_idx]
     if len(windowed_audio) < nperseg:
+        if verbose_errors:
+            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
+                  f"windowed_audio length ({len(windowed_audio)}) < nperseg ({nperseg}).")
         return None
 
     f, t, Sxx = spectrogram(windowed_audio, fs=sampling_rate,
@@ -201,14 +204,13 @@ def extract_segment_spectral_sum(wav_path, onset, offset, config,
     freq_mask = (f >= freq_cutoffs[0]) & (f <= freq_cutoffs[1])
     Sxx = Sxx[freq_mask, :]
     if Sxx.shape[0] == 0:
+        if verbose_errors:
+            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
+                  f"no frequency bins in range {freq_cutoffs} Hz "
+                  f"(f ranges {f.min():.1f}-{f.max():.1f} Hz at sampling_rate={sampling_rate}).")
         return None
 
     power_trace_db = decibel(Sxx.sum(axis=0))
-
-    # t is relative to win_start; shift so t=0 is the true onset. If the
-    # window was clipped at the recording start, win_start > onset - pad,
-    # so this shift still lands exactly on the true onset -- only the
-    # pre-onset context is shorter for that trace, never misaligned.
     t_aligned = t - (onset - win_start)
     offset_rel_to_onset = offset - onset
 
@@ -229,22 +231,28 @@ def main():
               "that .not.mat files exist alongside the .wav files.")
         return
 
+    config = {"global_dir": BIRD_ROOT}
+    run_diagnostic_check(all_segments, config)
+
     n_sample = max(1, int(round(total_found * SAMPLE_FRACTION)))
     n_sample = min(n_sample, total_found)
     sampled_segments = random.sample(all_segments, n_sample)
     print(f"Randomly sampled {n_sample} segments ({100 * n_sample / total_found:.1f}% "
           f"of total) for validation figure.")
 
-    config = {"global_dir": BIRD_ROOT}
-
     print("Extracting onset-aligned spectral-sum traces for sampled segments...")
     traces = []
+    n_printed_failures = 0
+    MAX_PRINTED_FAILURES = 10  # cap verbose output once the pattern is clear
     for i, seg in enumerate(sampled_segments):
+        verbose = n_printed_failures < MAX_PRINTED_FAILURES
         result = extract_segment_spectral_sum(
             seg["wav_path"], seg["onset"], seg["offset"], config,
             NPERSEG, NOVERLAP, NFFT, FREQ_CUTOFFS, PAD_SECONDS,
+            verbose_errors=verbose,
         )
         if result is None:
+            n_printed_failures += 1
             continue
         t_aligned, power_trace_db, offset_rel_to_onset, sampling_rate = result
         duration = seg["offset"] - seg["onset"]
@@ -259,7 +267,9 @@ def main():
     n_failed = n_sample - len(traces)
     if n_failed > 0:
         print(f"WARNING: {n_failed}/{n_sample} sampled segments failed to load "
-              f"and were excluded from the figure.")
+              f"and were excluded from the figure."
+              + (f" (only first {MAX_PRINTED_FAILURES} failures printed above)"
+                 if n_failed > MAX_PRINTED_FAILURES else ""))
 
     if not traces:
         print("ERROR: no segments could be successfully processed.")
@@ -277,7 +287,7 @@ def main():
     fig, ax = plt.subplots(figsize=(10, fig_height))
 
     row_gap = 1.0
-    trace_top = 0.9  # trace occupies [0, trace_top] within its row
+    trace_top = 0.9
     for row_idx, tr in enumerate(traces):
         power = tr["power"]
         power_norm = power - np.min(power)
@@ -286,22 +296,8 @@ def main():
 
         y_offset = row_idx * row_gap
         ax.plot(tr["t"], power_norm + y_offset, color="black", linewidth=0.6)
-
-        # Onset: every trace's t=0 is its true onset, so this line is at
-        # the exact same x-position for every row -- forms a single clean
-        # vertical reference line down the whole figure.
         ax.plot([0, 0], [y_offset, y_offset + trace_top],
                color="tab:green", linewidth=0.8, zorder=3)
-
-        # Offset: marked with a triangle marker sitting just above the
-        # trace (rather than a full vertical line), so the *marker shape*
-        # -- not a line blending into neighboring rows -- is what the eye
-        # tracks across rows. Because traces are sorted by duration, these
-        # markers form a monotonically-rightward "staircase" when
-        # segmentation is consistent; a marker that breaks the staircase
-        # pattern relative to its neighbors, or a trace whose energy
-        # visibly continues past its marker, flags a likely segmentation
-        # problem for that syllable.
         ax.plot(tr["offset_rel_to_onset"], y_offset + trace_top + 0.06,
                marker="v", color="tab:red", markersize=4,
                linestyle="none", zorder=3)
