@@ -1,4 +1,3 @@
-# utils/__init__.py
 from .file_utils import get_directories, read_batch, get_file_data_by_index, get_display_data, save_seg_class_recfile, get_files_for_day, get_files_for_experiment, get_files_for_bird, filter_segmented_files, filter_classified_files, save_features, remove_pkl_suffix, find_batch_files, create_batch_file
 from .plot_utils import update_plots, update_ax2_ax3, update_ax2, plot_data
 from .audio_utils import seconds_to_index, index_to_seconds, decibel, seconds_to_chunk_index
@@ -9,6 +8,5 @@ from .window_utils import open_resegment_window, open_cluster_window, open_train
 from .segment_utils import start_segment_evfuncs, segment_ml, start_create_segmentation_training_dataset, start_segment_files_thread
 from .label_utils import start_create_classification_training_dataset, create_classification_training_dataset, start_classify_files_thread, _load_checkpoint_with_compat
 from .training_utils import start_segmentation_training, start_classification_training 
-from .clustering_utils import start_clustering_thread, replace_labels_from_df, start_create_cluster_dataset_thread
+from .clustering_utils import start_clustering_thread, replace_labels_from_df, start_create_cluster_dataset_thread, start_vae_clustering_thread, run_vae_clustering, replace_labels_from_df_method, plot_generic_clusters
 from .dash_utils import start_dash_app_thread, stop_dash_app_thread
-
