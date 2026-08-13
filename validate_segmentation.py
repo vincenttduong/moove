@@ -4,12 +4,21 @@ MOOVE Segmentation Validation Script
 Generates a single figure for quickly eyeballing segmentation quality: every
 extracted syllable segment's power-vs-time trace ("spectral sum": the
 spectrogram collapsed across frequency, giving one energy value per time
-bin), stacked vertically in order of increasing duration, with the detected
-onset/offset boundaries overlaid as vertical lines on each trace. Poorly
-segmented syllables (onsets/offsets that clip signal, false-positive
-segments capturing silence/noise, wildly inconsistent durations for what
-should be the same call type, etc.) are usually easy to spot visually in
-this kind of stacked, duration-sorted view.
+bin), stacked vertically in order of increasing duration, all aligned so
+that t=0 is that segment's true onset. Offsets are marked with a distinct,
+easy-to-track marker (a red triangle sitting just above each trace, at that
+row's true offset position) so you can visually trace the "staircase" of
+offsets across rows and spot outliers -- e.g. a segment whose offset marker
+falls far from where its neighbors' do for a similar-looking trace, or a
+trace whose energy clearly continues past its offset marker (a truncated
+segment) or ends well before it (a segment capturing trailing silence).
+
+Traces are NOT padded/truncated to a common length: each trace's width
+reflects its own true duration (onset to offset, plus a small fixed pad on
+each side for context), so the actual spread of syllable durations remains
+visible in the figure -- which is the point of this validation step, since
+duration is diagnostic of segmentation quality (missed/extra onsets,
+merged/split syllables, etc. show up as duration outliers).
 
 MOOVE folder structure (as used by moove.utils.AppState._get_batch_files):
 
@@ -77,6 +86,11 @@ NPERSEG = 1024
 NOVERLAP = 896
 NFFT = 1024
 FREQ_CUTOFFS = (500, 10000)  # (low_hz, high_hz)
+
+# Fixed context padding shown before onset and after offset in each trace's
+# extraction window (does NOT equalize trace lengths -- every trace still
+# has width = duration + 2*PAD_SECONDS, so true duration remains visible).
+PAD_SECONDS = 0.02
 
 # Random seed for reproducible sampling (set to None for a fresh sample
 # every run).
@@ -147,14 +161,18 @@ def gather_all_segments(bird_root, experiment, days):
 
 def extract_segment_spectral_sum(wav_path, onset, offset, config,
                                   nperseg, noverlap, nfft, freq_cutoffs,
-                                  pad_seconds=0.02):
-    """Load a small window of raw audio around [onset, offset] (padded by
-    pad_seconds on each side so onset/offset lines aren't flush against the
-    trace edges), compute its spectrogram, restrict to freq_cutoffs, and
-    collapse across frequency (sum) to get a 1D power-vs-time trace in dB.
+                                  pad_seconds):
+    """Load raw audio spanning [onset - pad_seconds, offset + pad_seconds],
+    compute its spectrogram, restrict to freq_cutoffs, and collapse across
+    frequency (sum) to get a 1D power-vs-time trace in dB. Time is returned
+    ALIGNED TO ONSET: t=0 always corresponds to the true onset, so t=-pad
+    is the start of the window and t=(offset-onset) is the true offset,
+    regardless of whether the window had to be clipped at the start of the
+    recording (clipping only shortens the pre-onset context shown, it never
+    shifts the onset/offset positions themselves).
 
-    Returns (times_relative_to_window_start, power_trace_db, onset_rel,
-    offset_rel, sampling_rate) or None if loading/processing fails.
+    Returns (t_aligned_to_onset, power_trace_db, offset_rel_to_onset,
+    sampling_rate) or None if loading/processing fails.
     """
     file_path = {"file_name": os.path.basename(wav_path), "file_path": wav_path}
     try:
@@ -187,9 +205,14 @@ def extract_segment_spectral_sum(wav_path, onset, offset, config,
 
     power_trace_db = decibel(Sxx.sum(axis=0))
 
-    onset_rel = onset - win_start
-    offset_rel = offset - win_start
-    return t, power_trace_db, onset_rel, offset_rel, sampling_rate
+    # t is relative to win_start; shift so t=0 is the true onset. If the
+    # window was clipped at the recording start, win_start > onset - pad,
+    # so this shift still lands exactly on the true onset -- only the
+    # pre-onset context is shorter for that trace, never misaligned.
+    t_aligned = t - (onset - win_start)
+    offset_rel_to_onset = offset - onset
+
+    return t_aligned, power_trace_db, offset_rel_to_onset, sampling_rate
 
 
 def main():
@@ -214,20 +237,21 @@ def main():
 
     config = {"global_dir": BIRD_ROOT}
 
-    print("Extracting spectral-sum traces for sampled segments...")
+    print("Extracting onset-aligned spectral-sum traces for sampled segments...")
     traces = []
     for i, seg in enumerate(sampled_segments):
         result = extract_segment_spectral_sum(
             seg["wav_path"], seg["onset"], seg["offset"], config,
-            NPERSEG, NOVERLAP, NFFT, FREQ_CUTOFFS,
+            NPERSEG, NOVERLAP, NFFT, FREQ_CUTOFFS, PAD_SECONDS,
         )
         if result is None:
             continue
-        t, power_trace_db, onset_rel, offset_rel, sampling_rate = result
+        t_aligned, power_trace_db, offset_rel_to_onset, sampling_rate = result
         duration = seg["offset"] - seg["onset"]
         traces.append({
-            "t": t, "power": power_trace_db, "onset_rel": onset_rel,
-            "offset_rel": offset_rel, "duration": duration, "day": seg["day"],
+            "t": t_aligned, "power": power_trace_db,
+            "offset_rel_to_onset": offset_rel_to_onset,
+            "duration": duration, "day": seg["day"],
         })
         if (i + 1) % 100 == 0:
             print(f"  Processed {i + 1}/{n_sample} segments...")
@@ -243,34 +267,54 @@ def main():
 
     traces.sort(key=lambda tr: tr["duration"])
 
-    print(f"Rendering figure with {len(traces)} segments, sorted by duration...")
+    print(f"Rendering figure with {len(traces)} segments, sorted by duration, "
+          f"aligned to onset...")
     n = len(traces)
+    min_t = min(tr["t"][0] if len(tr["t"]) else 0 for tr in traces)
     max_t = max(tr["t"][-1] if len(tr["t"]) else 0 for tr in traces)
 
     fig_height = max(6, min(0.12 * n, 60))
     fig, ax = plt.subplots(figsize=(10, fig_height))
 
     row_gap = 1.0
+    trace_top = 0.9  # trace occupies [0, trace_top] within its row
     for row_idx, tr in enumerate(traces):
         power = tr["power"]
         power_norm = power - np.min(power)
         max_range = np.max(power_norm) if np.max(power_norm) > 0 else 1.0
-        power_norm = power_norm / max_range * 0.9
+        power_norm = power_norm / max_range * trace_top
 
         y_offset = row_idx * row_gap
         ax.plot(tr["t"], power_norm + y_offset, color="black", linewidth=0.6)
-        ax.plot([tr["onset_rel"], tr["onset_rel"]], [y_offset, y_offset + 0.9],
-               color="tab:green", linewidth=0.8)
-        ax.plot([tr["offset_rel"], tr["offset_rel"]], [y_offset, y_offset + 0.9],
-               color="tab:red", linewidth=0.8)
 
-    ax.set_xlim(0, max_t)
+        # Onset: every trace's t=0 is its true onset, so this line is at
+        # the exact same x-position for every row -- forms a single clean
+        # vertical reference line down the whole figure.
+        ax.plot([0, 0], [y_offset, y_offset + trace_top],
+               color="tab:green", linewidth=0.8, zorder=3)
+
+        # Offset: marked with a triangle marker sitting just above the
+        # trace (rather than a full vertical line), so the *marker shape*
+        # -- not a line blending into neighboring rows -- is what the eye
+        # tracks across rows. Because traces are sorted by duration, these
+        # markers form a monotonically-rightward "staircase" when
+        # segmentation is consistent; a marker that breaks the staircase
+        # pattern relative to its neighbors, or a trace whose energy
+        # visibly continues past its marker, flags a likely segmentation
+        # problem for that syllable.
+        ax.plot(tr["offset_rel_to_onset"], y_offset + trace_top + 0.06,
+               marker="v", color="tab:red", markersize=4,
+               linestyle="none", zorder=3)
+
+    ax.axvline(0, color="tab:green", linewidth=0.5, alpha=0.25, zorder=1)
+    ax.set_xlim(min_t, max_t + 0.05)
     ax.set_ylim(-0.5, n * row_gap)
-    ax.set_xlabel("Time within extraction window (s)")
+    ax.set_xlabel("Time relative to segment onset (s)")
     ax.set_ylabel("Segment (sorted by increasing duration, bottom to top)")
     ax.set_title(
-        f"Segmentation Validation: {n} sampled segments\n"
-        f"(green = onset, red = offset; window padded \u00b120ms around each segment)"
+        f"Segmentation Validation: {n} sampled segments, aligned to onset\n"
+        f"(green line = onset (t=0); red \u25bd = offset; "
+        f"\u00b1{PAD_SECONDS * 1000:.0f}ms context padding each side)"
     )
     ax.set_yticks([])
 
