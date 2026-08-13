@@ -129,6 +129,14 @@ class AppState:
             'min_dist': Var(value="0.1"),
             'n_clusters': Var(value="10"),
         }
+        self.vae_gmm_params = {
+            'latent_dim': Var(value="32"),
+            'epochs': Var(value="200"),
+            'batch_size': Var(value="64"),
+            'learning_rate': Var(value="0.001"),
+            'bic_min_components': Var(value="2"),
+            'bic_max_components': Var(value="20"),
+        }
         self.train_classification_params = {
             'epochs': Var(value="1000"),
             'batch_size': Var(value="64"),
@@ -201,6 +209,7 @@ class AppState:
                 'mlseg_params': {key: value.get() for key, value in self.mlseg_params.items()},
                 'spec_params': {key: value.get() for key, value in self.spec_params.items()},
                 'umap_k_means_params': {key: value.get() for key, value in self.umap_k_means_params.items()},
+                'vae_gmm_params': {key: value.get() for key, value in self.vae_gmm_params.items()},
                 'train_segmentation_params': {key: value.get() for key, value in self.train_segmentation_params.items()},
                 'train_classification_params': {key: value.get() for key, value in self.train_classification_params.items()},
                 'augmentation_params': {key: value.get() for key, value in self.augmentation_params.items()},
@@ -248,6 +257,9 @@ class AppState:
         for key, value in state_dict.get('umap_k_means_params', {}).items():
             if key in self.umap_k_means_params:
                 self.umap_k_means_params[key].set(value)
+        for key, value in state_dict.get('vae_gmm_params', {}).items():
+            if key in self.vae_gmm_params:
+                self.vae_gmm_params[key].set(value)
         for key, value in state_dict.get('train_segmentation_params', {}).items():
             if key in self.train_segmentation_params:
                 self.train_segmentation_params[key].set(value)
