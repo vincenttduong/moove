@@ -2,31 +2,47 @@
 MOOVE Segmentation Validation Script
 ======================================
 Generates THREE figures for quickly eyeballing segmentation quality, all
-using the same pooled/sampled/onset-aligned/duration-sorted segment set:
+showing each sampled syllable IN ITS ORIGINAL CONTEXT -- i.e. with real
+signal shown well before onset and well after offset, not just a small
+fixed pad -- using a common, duration-independent window shared across
+every row so the figures stack into clean rectangular matrices:
 
   1. Energy heatmap: each segment's power-vs-time trace (spectrogram
      collapsed across frequency), stacked as rows of a single 2D heatmap
      image (imshow), sorted by increasing duration, onset-aligned so every
-     row's true onset is at the same x-pixel. Vertically condensed vs. a
-     line-per-row plot.
-  2. Energy line plot (original style): same data as (1), but as
-     individual line traces with an offset marker, kept for cases where
-     the line-plot level of detail is preferred over a heatmap.
+     row's true onset is at the same x-pixel.
+  2. Energy line plot: same data as (1), as individual line traces with an
+     offset marker, for cases where the line-plot level of detail is
+     preferred over the heatmap.
   3. Spectrogram heatmap: each segment's FULL spectrogram (not collapsed
      across frequency), frequency axis compressed (binned/averaged) so
-     many stacked segments still fit in a reasonable figure height, laid
-     out as one tall image with segments stacked vertically, onset-aligned
-     and duration-sorted identically to (1).
+     many stacked segments still fit in a reasonable figure height.
 
-To stack into single rectangular images, every segment's trace/spectrogram
-is right-padded (not truncated) out to a common width of
-    RIGHT_PAD_TARGET = 1.1 * max_sampled_duration + PAD_SECONDS
-measured from onset (t=0), so the widest realistic segment plus its
-context pad defines the matrix width and everything shorter is padded with
-a distinct "no data" fill (NaN, rendered as a fixed background color) --
-never zero, since zero could be misread as real low-energy signal. This
-padding is for DISPLAY ONLY: it does not affect clustering or any other
-downstream analysis, only how this validation figure is rendered.
+WINDOWING (this is the part that shows original context around each
+syllable, rather than just the syllable + a small pad):
+
+  - LEFT_EXTENSION_SECONDS: how far before onset (t=0) to show, for every
+    row. This is NOT capped by that row's own duration -- it's real signal
+    preceding the segment, extended by a user-chosen amount.
+  - RIGHT_EXTENSION_SECONDS: extends past the OFFSET OF THE LONGEST SAMPLED
+    SYLLABLE, not past each row's own offset. Every row shares this exact
+    same right boundary (t = max_duration + RIGHT_EXTENSION_SECONDS from
+    onset), so a short syllable's window extends well past its own offset
+    to match the longest syllable's window length -- this is what keeps
+    the stacked matrix rectangular while showing every row a consistent
+    amount of context.
+
+    Worked example: syllable 1 duration=0.05s, syllable 2 (longest)
+    duration=0.10s, RIGHT_EXTENSION_SECONDS=0.05. Both syllables' windows
+    extend to t=0.10+0.05=0.15 from their own onset (t=0), even though
+    syllable 1's own offset is only at t=0.05.
+
+  - If a row's window (using its own onset/offset in the original
+    recording) would extend before the start or past the end of that
+    recording, it is truncated at the recording boundary and the missing
+    portion is padded with the same "no data" gray fill used elsewhere
+    (NaN under the colormap's set_bad color) -- never zero, since zero
+    could be misread as real low-energy signal.
 
 MOOVE folder structure (as used by moove.utils.AppState._get_batch_files):
 
@@ -51,7 +67,6 @@ import os
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
 from scipy.signal import spectrogram
 
 from moove.utils import get_display_data, decibel
@@ -69,12 +84,18 @@ NPERSEG = 1024
 NOVERLAP = 896
 NFFT = 1024
 FREQ_CUTOFFS = (500, 10000)  # (low_hz, high_hz)
-PAD_SECONDS = 0.02
+
+# How far before onset (t=0) to show, for every sampled syllable, to
+# reveal original signal context preceding the segment.
+LEFT_EXTENSION_SECONDS = 0.1
+
+# How far past the OFFSET OF THE LONGEST SAMPLED SYLLABLE (not each row's
+# own offset) every row's shared right window boundary extends. See the
+# worked example in the module docstring above.
+RIGHT_EXTENSION_SECONDS = 0.1
 
 # Number of frequency bins to compress the full spectrogram down to for
 # figure 3 (averaged/binned from the native NFFT-derived frequency axis).
-# Keeps stacked spectrogram figure height reasonable regardless of how
-# many segments are sampled.
 SPECTROGRAM_FREQ_BINS = 24
 
 RANDOM_SEED = 42
@@ -172,50 +193,59 @@ def run_diagnostic_check(all_segments, config):
     print("--- End diagnostic check ---\n")
 
 
-def extract_segment_data(wav_path, onset, offset, config,
-                         nperseg, noverlap, nfft, freq_cutoffs,
-                         pad_seconds, verbose_errors=True):
-    """Load raw audio spanning [onset - pad_seconds, offset + pad_seconds],
-    compute its spectrogram restricted to freq_cutoffs, and return BOTH the
-    frequency-collapsed 1D power trace AND the full 2D spectrogram, so
-    figures 1/2 and figure 3 reuse a single audio load + spectrogram call
-    per segment rather than computing it twice.
+def load_audio_and_compute_windowed_spectrogram(wav_path, onset, win_start_t, win_end_t,
+                                                 config, nperseg, noverlap, nfft, freq_cutoffs,
+                                                 verbose_errors=True):
+    """Load raw audio for the ABSOLUTE window [onset + win_start_t, onset + win_end_t]
+    (i.e. win_start_t/win_end_t are already relative to onset, negative
+    win_start_t means "before onset"), clipped to the recording's actual
+    [0, recording_duration] bounds, compute its spectrogram restricted to
+    freq_cutoffs, and return time aligned so t=0 is still the true onset
+    (even though the window may have been clipped at a recording
+    boundary -- clipping only shortens how much of the requested window is
+    actually shown for that row, it never shifts the onset reference).
 
-    Time (t) and the spectrogram's time axis are ALIGNED TO ONSET: t=0 is
-    always the true onset.
-
-    Returns a dict with keys: t, power_db, offset_rel_to_onset, f,
-    spectrogram_db (2D, freq x time), sampling_rate -- or None on failure.
+    Returns a dict with keys: t, power_db, f, spectrogram_db (2D, freq x
+    time), sampling_rate, clipped_left (bool), clipped_right (bool) -- or
+    None on failure.
     """
     file_path = {"file_name": os.path.basename(wav_path), "file_path": wav_path}
     try:
         display_dict = get_display_data(file_path, config)
     except Exception as e:
         if verbose_errors:
-            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
+            print(f"  FAIL [{os.path.basename(wav_path)} @ onset={onset:.3f}s]: "
                   f"get_display_data() raised: {e}")
         return None
 
     sampling_rate = int(display_dict["sampling_rate"])
     rawsong = display_dict["song_data"]
+    recording_duration = len(rawsong) / sampling_rate
 
-    win_start = max(0.0, onset - pad_seconds)
-    win_end = offset + pad_seconds
-    start_idx = int(win_start * sampling_rate)
-    end_idx = int(win_end * sampling_rate)
-    end_idx = min(end_idx, len(rawsong))
+    requested_abs_start = onset + win_start_t
+    requested_abs_end = onset + win_end_t
+
+    abs_start = max(0.0, requested_abs_start)
+    abs_end = min(recording_duration, requested_abs_end)
+    clipped_left = abs_start > requested_abs_start
+    clipped_right = abs_end < requested_abs_end
+
+    start_idx = int(abs_start * sampling_rate)
+    end_idx = min(int(abs_end * sampling_rate), len(rawsong))
 
     if start_idx >= end_idx:
         if verbose_errors:
-            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
-                  f"start_idx ({start_idx}) >= end_idx ({end_idx}).")
+            print(f"  FAIL [{os.path.basename(wav_path)} @ onset={onset:.3f}s]: "
+                  f"requested window entirely outside recording bounds "
+                  f"(recording_duration={recording_duration:.3f}s).")
         return None
 
     windowed_audio = rawsong[start_idx:end_idx]
     if len(windowed_audio) < nperseg:
         if verbose_errors:
-            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
-                  f"windowed_audio length ({len(windowed_audio)}) < nperseg ({nperseg}).")
+            print(f"  FAIL [{os.path.basename(wav_path)} @ onset={onset:.3f}s]: "
+                  f"windowed_audio length ({len(windowed_audio)}) < nperseg ({nperseg}) "
+                  f"after clipping to recording bounds.")
         return None
 
     f, t, Sxx = spectrogram(windowed_audio, fs=sampling_rate,
@@ -225,20 +255,19 @@ def extract_segment_data(wav_path, onset, offset, config,
     Sxx = Sxx[freq_mask, :]
     if Sxx.shape[0] == 0:
         if verbose_errors:
-            print(f"  FAIL [{os.path.basename(wav_path)} @ {onset:.3f}-{offset:.3f}s]: "
+            print(f"  FAIL [{os.path.basename(wav_path)} @ onset={onset:.3f}s]: "
                   f"no frequency bins in range {freq_cutoffs} Hz.")
         return None
 
     spectrogram_db = decibel(Sxx)
     power_db = decibel(Sxx.sum(axis=0))
-    t_aligned = t - (onset - win_start)
-    offset_rel_to_onset = offset - onset
+    # t is relative to abs_start; shift so t=0 is the true onset.
+    t_aligned = t - (onset - abs_start)
 
     return {
-        "t": t_aligned, "power_db": power_db,
-        "offset_rel_to_onset": offset_rel_to_onset,
-        "f": f, "spectrogram_db": spectrogram_db,
-        "sampling_rate": sampling_rate,
+        "t": t_aligned, "power_db": power_db, "f": f,
+        "spectrogram_db": spectrogram_db, "sampling_rate": sampling_rate,
+        "clipped_left": clipped_left, "clipped_right": clipped_right,
     }
 
 
@@ -257,31 +286,33 @@ def bin_frequency_axis(spectrogram_db, n_bins):
     return binned
 
 
-def build_padded_matrix(traces_2d_or_1d, n_time_bins, dt, is_2d):
-    """Right-pad a list of (variable-width) traces onto a common time axis
-    of length n_time_bins (sampled at spacing dt, starting at the shared
-    onset-aligned t=0 reference, i.e. col 0 corresponds to whichever t is
-    closest to each row's own window start). Padding uses NaN so it can be
-    rendered as a distinct background color, never mistaken for real
-    (zero-energy) signal.
+def build_padded_matrix(items, n_time_bins, dt, left_extension_seconds, is_2d):
+    """Right/left-pad a list of (variable-width, possibly recording-boundary
+    -clipped) traces onto a common time axis of length n_time_bins, where
+    column 0 corresponds to t = -left_extension_seconds (the shared left
+    edge of every row's window) and t=0 (true onset) therefore always
+    lands at the same fixed column for every row. Padding uses NaN so it
+    renders as a distinct background color, never mistaken for real
+    (zero-energy) signal -- this covers both recording-boundary clipping
+    and the fact that shorter syllables' windows are shorter than the
+    shared right boundary defined by the longest sampled syllable.
 
-    is_2d=True expects each item to itself be (n_freq_bins, n_time_native)
+    is_2d=True expects each item's data to be (n_freq_bins, n_time_native)
     (for the spectrogram figure); is_2d=False expects 1D power traces.
-    Returns a 2D matrix (n_rows, n_time_bins) if is_2d=False, or a 3D
-    array (n_rows, n_freq_bins, n_time_bins) if is_2d=True.
     """
-    n_rows = len(traces_2d_or_1d)
+    n_rows = len(items)
     if is_2d:
-        n_freq_bins = traces_2d_or_1d[0][0].shape[0]
+        n_freq_bins = items[0][0].shape[0]
         matrix = np.full((n_rows, n_freq_bins, n_time_bins), np.nan, dtype=float)
     else:
         matrix = np.full((n_rows, n_time_bins), np.nan, dtype=float)
 
-    for row_idx, item in enumerate(traces_2d_or_1d):
-        data, t = item
+    for row_idx, (data, t) in enumerate(items):
         n_cols = data.shape[1] if is_2d else len(data)
+        if n_cols == 0:
+            continue
 
-        col_start = int(round((t[0] + PAD_SECONDS_GLOBAL) / dt)) if n_cols else 0
+        col_start = int(round((t[0] + left_extension_seconds) / dt))
         col_start = max(0, col_start)
         col_end = min(n_time_bins, col_start + n_cols)
         n_fit = col_end - col_start
@@ -297,9 +328,6 @@ def build_padded_matrix(traces_2d_or_1d, n_time_bins, dt, is_2d):
 
 
 def main():
-    global PAD_SECONDS_GLOBAL
-    PAD_SECONDS_GLOBAL = PAD_SECONDS
-
     if RANDOM_SEED is not None:
         random.seed(RANDOM_SEED)
 
@@ -322,21 +350,37 @@ def main():
     print(f"Randomly sampled {n_sample} segments ({100 * n_sample / total_found:.1f}% "
           f"of total).")
 
+    max_duration = max(seg["offset"] - seg["onset"] for seg in sampled_segments)
+    # Shared window (relative to each row's own onset) applied to EVERY row:
+    #   left edge  = -LEFT_EXTENSION_SECONDS
+    #   right edge = max_duration + RIGHT_EXTENSION_SECONDS
+    # This is what keeps the final matrix rectangular while showing every
+    # syllable a consistent, duration-independent amount of context.
+    win_start_t = -LEFT_EXTENSION_SECONDS
+    win_end_t = max_duration + RIGHT_EXTENSION_SECONDS
+    print(f"Longest sampled syllable duration: {max_duration * 1000:.1f}ms. "
+          f"Shared window per row: [onset {win_start_t * 1000:+.1f}ms, "
+          f"onset {win_end_t * 1000:+.1f}ms] "
+          f"(width={ (win_end_t - win_start_t) * 1000:.1f}ms).")
+
     print("Extracting onset-aligned traces and spectrograms for sampled segments...")
     entries = []
     n_printed_failures = 0
+    n_clipped = 0
     MAX_PRINTED_FAILURES = 10
     for i, seg in enumerate(sampled_segments):
         verbose = n_printed_failures < MAX_PRINTED_FAILURES
-        result = extract_segment_data(
-            seg["wav_path"], seg["onset"], seg["offset"], config,
-            NPERSEG, NOVERLAP, NFFT, FREQ_CUTOFFS, PAD_SECONDS,
-            verbose_errors=verbose,
+        result = load_audio_and_compute_windowed_spectrogram(
+            seg["wav_path"], seg["onset"], win_start_t, win_end_t, config,
+            NPERSEG, NOVERLAP, NFFT, FREQ_CUTOFFS, verbose_errors=verbose,
         )
         if result is None:
             n_printed_failures += 1
             continue
+        if result["clipped_left"] or result["clipped_right"]:
+            n_clipped += 1
         result["duration"] = seg["offset"] - seg["onset"]
+        result["offset_rel_to_onset"] = result["duration"]
         result["day"] = seg["day"]
         entries.append(result)
         if (i + 1) % 100 == 0:
@@ -348,6 +392,10 @@ def main():
               f"and were excluded."
               + (f" (only first {MAX_PRINTED_FAILURES} failures printed above)"
                  if n_failed > MAX_PRINTED_FAILURES else ""))
+    if n_clipped > 0:
+        print(f"NOTE: {n_clipped}/{len(entries)} segments had their requested window "
+              f"clipped at a recording boundary (start or end of that .wav file); "
+              f"the missing portion is padded gray in the figures.")
 
     if not entries:
         print("ERROR: no segments could be successfully processed.")
@@ -355,27 +403,23 @@ def main():
 
     entries.sort(key=lambda e: e["duration"])
     n = len(entries)
-    max_duration = max(e["duration"] for e in entries)
-    right_pad_target = 1.1 * max_duration + PAD_SECONDS
     dt = entries[0]["t"][1] - entries[0]["t"][0] if len(entries[0]["t"]) > 1 else 0.001
-    n_time_bins = int(np.ceil((PAD_SECONDS + right_pad_target) / dt))
+    n_time_bins = int(np.ceil((win_end_t - win_start_t) / dt))
 
-    print(f"Building padded matrices: {n} rows x {n_time_bins} time bins "
-          f"(right-padded to 1.1*max_duration + pad = {right_pad_target * 1000:.1f}ms "
-          f"from onset)...")
+    print(f"Building padded matrices: {n} rows x {n_time_bins} time bins...")
 
     # ------------------------------------------------------------------
-    # Figure 1: energy heatmap (frequency-collapsed power trace per row,
-    # stacked into one 2D image rather than individually-drawn lines).
+    # Figure 1: energy heatmap.
     # ------------------------------------------------------------------
     energy_matrix = build_padded_matrix(
-        [(e["power_db"], e["t"]) for e in entries], n_time_bins, dt, is_2d=False)
+        [(e["power_db"], e["t"]) for e in entries], n_time_bins, dt,
+        LEFT_EXTENSION_SECONDS, is_2d=False)
 
     fig_h1 = max(4, min(0.04 * n, 20))
     fig1, ax1 = plt.subplots(figsize=(10, fig_h1))
     cmap1 = plt.get_cmap("viridis").copy()
     cmap1.set_bad(color="lightgray")
-    extent = [-PAD_SECONDS, n_time_bins * dt - PAD_SECONDS, n, 0]
+    extent = [win_start_t, win_start_t + n_time_bins * dt, n, 0]
     im1 = ax1.imshow(np.ma.masked_invalid(energy_matrix), aspect="auto",
                      cmap=cmap1, extent=extent, interpolation="nearest")
     ax1.axvline(0, color="white", linewidth=0.8, alpha=0.7)
@@ -385,14 +429,15 @@ def main():
     ax1.set_xlabel("Time relative to segment onset (s)")
     ax1.set_ylabel("Segment (sorted by increasing duration, top to bottom)")
     ax1.set_title(f"Segmentation Validation: Energy Heatmap ({n} segments)\n"
-                  f"(white line = onset; red \u25bd = offset; gray = padding)")
+                  f"(white line = onset; red \u25bd = offset; gray = padding/recording boundary; "
+                  f"window: onset {win_start_t*1000:+.0f}ms to {win_end_t*1000:+.0f}ms)")
     fig1.colorbar(im1, ax=ax1, label="Power (dB)", fraction=0.02, pad=0.02)
     plt.tight_layout()
     plt.savefig(OUTPUT_HEATMAP_PATH, dpi=150)
     print(f"Saved energy heatmap to {OUTPUT_HEATMAP_PATH}")
 
     # ------------------------------------------------------------------
-    # Figure 2: energy line plot (original style, kept alongside heatmap).
+    # Figure 2: energy line plot.
     # ------------------------------------------------------------------
     fig_h2 = max(6, min(0.12 * n, 60))
     fig2, ax2 = plt.subplots(figsize=(10, fig_h2))
@@ -408,9 +453,7 @@ def main():
         ax2.plot(e["offset_rel_to_onset"], y_off + trace_top + 0.06, marker="v",
                  color="tab:red", markersize=4, linestyle="none", zorder=3)
     ax2.axvline(0, color="tab:green", linewidth=0.5, alpha=0.25, zorder=1)
-    min_t = min(e["t"][0] if len(e["t"]) else 0 for e in entries)
-    max_t = max(e["t"][-1] if len(e["t"]) else 0 for e in entries)
-    ax2.set_xlim(min_t, max_t + 0.05)
+    ax2.set_xlim(win_start_t, win_end_t)
     ax2.set_ylim(-0.5, n * row_gap)
     ax2.set_xlabel("Time relative to segment onset (s)")
     ax2.set_ylabel("Segment (sorted by increasing duration, bottom to top)")
@@ -427,11 +470,9 @@ def main():
     print(f"Binning frequency axis to {SPECTROGRAM_FREQ_BINS} bins per segment...")
     binned_specs = [bin_frequency_axis(e["spectrogram_db"], SPECTROGRAM_FREQ_BINS) for e in entries]
     spec_matrix_3d = build_padded_matrix(
-        [(binned_specs[i], entries[i]["t"]) for i in range(n)], n_time_bins, dt, is_2d=True)
+        [(binned_specs[i], entries[i]["t"]) for i in range(n)], n_time_bins, dt,
+        LEFT_EXTENSION_SECONDS, is_2d=True)
 
-    # Stack rows vertically: each segment occupies SPECTROGRAM_FREQ_BINS
-    # pixel-rows of the final image, separated by a thin NaN gap row so
-    # segment boundaries remain visible.
     gap_rows = 1
     total_rows = n * (SPECTROGRAM_FREQ_BINS + gap_rows)
     stacked_spec = np.full((total_rows, n_time_bins), np.nan, dtype=float)
@@ -443,7 +484,7 @@ def main():
     fig3, ax3 = plt.subplots(figsize=(10, fig_h3))
     cmap3 = plt.get_cmap("magma").copy()
     cmap3.set_bad(color="lightgray")
-    extent3 = [-PAD_SECONDS, n_time_bins * dt - PAD_SECONDS, total_rows, 0]
+    extent3 = [win_start_t, win_start_t + n_time_bins * dt, total_rows, 0]
     im3 = ax3.imshow(np.ma.masked_invalid(stacked_spec), aspect="auto",
                      cmap=cmap3, extent=extent3, interpolation="nearest")
     ax3.axvline(0, color="white", linewidth=0.8, alpha=0.7)
@@ -456,7 +497,7 @@ def main():
                    f"[{SPECTROGRAM_FREQ_BINS} freq bins/segment, {FREQ_CUTOFFS[0]}-{FREQ_CUTOFFS[1]} Hz]")
     ax3.set_yticks([])
     ax3.set_title(f"Segmentation Validation: Full Spectrograms ({n} segments)\n"
-                  f"(white line = onset; cyan \u25bd = offset; gray = padding)")
+                  f"(white line = onset; cyan \u25bd = offset; gray = padding/recording boundary)")
     fig3.colorbar(im3, ax=ax3, label="Power (dB)", fraction=0.02, pad=0.02)
     plt.tight_layout()
     plt.savefig(OUTPUT_SPECTROGRAM_PATH, dpi=150)
